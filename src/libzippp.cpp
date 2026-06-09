@@ -417,43 +417,66 @@ int ZipArchive::close(void) {
         if (bufferData!=nullptr && (mode==New || mode==Write)) {
             int srcOpen = zip_source_open(zipSource);
             if (srcOpen==0) {
-                void* sourceBuffer = *bufferData;
-                void* tempBuffer = sourceBuffer;
+                //IMPORTANT: the rewritten archive is read back into a *freshly allocated*
+                //buffer. We must never read into nor realloc *bufferData here: that memory
+                //is the storage backing the libzip source we are currently reading from.
+                //Reusing it aliases the source and, depending on the libzip version (i.e.
+                //whether it takes ownership of the buffer when writing), it makes
+                //zip_source_free() release a buffer that realloc() already moved/freed,
+                //which results in a double-free (see double_free_report / fromWritableBuffer).
                 zip_int64_t increment = 1024;
-                zip_int64_t tempBufferSize = bufferLength;
-                zip_int64_t read = zip_source_read(zipSource, tempBuffer, tempBufferSize);
+                zip_int64_t capacity = bufferLength>0 ? static_cast<zip_int64_t>(bufferLength) : increment;
+                char* outBuffer = static_cast<char*>(malloc(capacity * sizeof(char)));
+                char* tempBuffer = outBuffer;
+                zip_int64_t tempBufferSize = capacity;
                 zip_int64_t totalRead = 0;
+                zip_int64_t read = (outBuffer==nullptr) ? -1 : zip_source_read(zipSource, tempBuffer, tempBufferSize);
                 while(read>0) {
                     totalRead += read;
-                    tempBufferSize -= read;
-                    if (tempBufferSize<=0) {
-                        zip_int64_t newLength = bufferLength + increment;
-                        sourceBuffer = realloc(sourceBuffer, newLength * sizeof(char));
-                        if (sourceBuffer==nullptr) {
+                    if (totalRead>=capacity) {
+                        zip_int64_t newCapacity = capacity + increment;
+                        char* grownBuffer = static_cast<char*>(realloc(outBuffer, newCapacity * sizeof(char)));
+                        if (grownBuffer==nullptr) {
                             Helper::callErrorHandlingCallback(zipHandle, "can't read back from source: unable to extend buffer\n", errorHandlingCallback);
-                            return LIBZIPPP_ERROR_MEMORY_ALLOCATION;
+                            ::free(outBuffer);
+                            outBuffer = nullptr;
+                            read = -1;
+                            break;
                         }
-
-                        tempBuffer = static_cast<char*>(sourceBuffer)+bufferLength;
-                        tempBufferSize = increment;
-                        bufferLength = newLength;
-                    } else {
-                        tempBuffer = static_cast<char*>(tempBuffer)+read;
+                        outBuffer = grownBuffer;
+                        capacity = newCapacity;
                     }
+                    tempBuffer = outBuffer+totalRead;
+                    tempBufferSize = capacity-totalRead;
                     read = zip_source_read(zipSource, tempBuffer, tempBufferSize);
                 }
 
                 zip_source_close(zipSource);
 
-                *bufferData = sourceBuffer;
-                bufferLength = totalRead;
+                if (outBuffer!=nullptr && read>=0) {
+                    //freeing zipSource first guarantees libzip has released whatever it owns
+                    //before we touch *bufferData. With freep=0 (see openBuffer) libzip never
+                    //frees *bufferData itself, so reclaiming it here is safe and leak-free.
+                    zip_source_free(zipSource);
+                    zipSource = nullptr;
+
+                    ::free(*bufferData);
+                    *bufferData = outBuffer;
+                    bufferLength = totalRead;
+                } else {
+                    Helper::callErrorHandlingCallback(zipHandle, "can't read back from source: changes were not pushed in the buffer\n", errorHandlingCallback);
+                    res_code = LIBZIPPP_ERROR_HANDLE_FAILURE;
+                    if (outBuffer!=nullptr) { ::free(outBuffer); }
+                    zip_source_free(zipSource);
+                    zipSource = nullptr;
+                }
             } else {
                 Helper::callErrorHandlingCallback((zip*)nullptr, "can't read back from source: changes were not pushed in the buffer\n", errorHandlingCallback);
                 res_code = LIBZIPPP_ERROR_HANDLE_FAILURE;
-            }
 
-            zip_source_free(zipSource);
-            zipSource = nullptr;
+                zip_source_free(zipSource);
+                zipSource = nullptr;
+            }
         }
 
         mode = NotOpen;

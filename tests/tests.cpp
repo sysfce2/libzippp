@@ -961,12 +961,118 @@ void test24() {
     cout << " done." << endl;
 }
 
+/*
+ * Regression test for the double-free reported against ZipArchive::close() when an
+ * archive opened with fromWritableBuffer is modified and closed (double_free_report.pdf).
+ *
+ * close() must read the rewritten archive back into a freshly allocated buffer instead
+ * of reusing/realloc'ing the very buffer that backs the libzip source. The crafted input
+ * below makes the rewrite exceed the original buffer length, which forces the buffer to
+ * grow inside close() - the exact path that used to free the source-backed buffer twice.
+ *
+ * Under AddressSanitizer/valgrind (see the Makefile tests targets), a regression would
+ * surface as a double-free / invalid-free here.
+ */
+void test25() {
+    cout << "Running test 25...";
+
+    // 210 bytes - crafted ZIP from double_free_report.pdf:
+    //   the local file header declares a filename length of 0x1012 (4114) while the real
+    //   name "sample_content.txt" is 18 bytes and the central directory agrees on 18.
+    //   This inconsistency drives the rewrite past the original buffer length on close().
+    static const unsigned char craftedZip[] = {
+        0x50, 0x4b, 0x03, 0x04, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x36, 0x42,
+        0x9c, 0x5a, 0xfa, 0x29, 0x42, 0xbc, 0x18, 0x00, 0x00, 0x00, 0x18, 0x00,
+        0x00, 0x00, 0x12, 0x10, 0x1c, 0x00, 0x73, 0x61, 0x6d, 0x70, 0x6c, 0x65,
+        0x5f, 0x63, 0x6f, 0x6e, 0x74, 0x65, 0x6e, 0x74, 0x2e, 0x74, 0x78, 0x74,
+        0x55, 0x54, 0x09, 0x00, 0x03, 0xa8, 0x39, 0x0f, 0x68, 0xa8, 0x39, 0x0f,
+        0x68, 0x75, 0x78, 0x0b, 0x00, 0x01, 0x04, 0x00, 0x00, 0x00, 0x00, 0x04,
+        0x00, 0x00, 0x00, 0x00, 0x41, 0x46, 0x4c, 0x2b, 0x2b, 0x20, 0x66, 0x75,
+        0x7a, 0x7a, 0x20, 0x74, 0x65, 0x73, 0x74, 0x20, 0x73, 0x61, 0x6d, 0x70,
+        0x6c, 0x65, 0x2e, 0x0a, 0x50, 0x4b, 0x01, 0x02, 0x1e, 0x03, 0x0a, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x36, 0x42, 0x9c, 0x5a, 0xfa, 0x29, 0x42, 0xbc,
+        0x18, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x12, 0x00, 0x18, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xa4, 0x81, 0x00, 0x00,
+        0x00, 0x00, 0x73, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x5f, 0x63, 0x6f, 0x6e,
+        0x74, 0x65, 0x6e, 0x74, 0x2e, 0x74, 0x78, 0x74, 0x55, 0x54, 0x05, 0x00,
+        0x03, 0xa8, 0x39, 0x0f, 0x68, 0x75, 0x78, 0x0b, 0x00, 0x01, 0x04, 0x00,
+        0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x50, 0x4b, 0x05, 0x06,
+        0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x58, 0x00, 0x00, 0x00,
+        0x64, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    const libzippp_uint32 craftedSize = sizeof(craftedZip);
+
+    // --- exact reproduction of the reported harness: writable buffer (with headroom),
+    //     open in Write mode, perform one modification, then close. ---
+    {
+        libzippp_uint32 bufferSize = craftedSize + 4096;
+        void* buffer = calloc(bufferSize, sizeof(char)); //must be malloc/calloc for fromWritableBuffer
+        memcpy(buffer, craftedZip, craftedSize);
+
+        ZipArchive* z = ZipArchive::fromWritableBuffer(&buffer, bufferSize, ZipArchive::Write);
+        assert(z != nullptr);
+        z->addEntry("fuzz_entry/");
+        int rst = z->close(); //used to double-free here
+        assert(rst == LIBZIPPP_OK);
+
+        //the buffer must remain reopenable after the rewrite (no corruption of the pointer)
+        libzippp_uint32 newLength = (libzippp_uint32)z->getBufferLength();
+        ZipArchive::free(z);
+
+        ZipArchive* zr = ZipArchive::fromBuffer(buffer, newLength);
+        assert(zr != nullptr);
+        assert(zr->hasEntry("fuzz_entry/"));
+        ZipArchive::free(zr);
+
+        free(buffer); //single owner: the buffer pointer is always valid and freeable
+    }
+
+    // --- grow + cloning path: reopen an existing archive in a tight buffer and add an
+    //     entry so the rewrite must exceed the original length, forcing the grow loop. ---
+    {
+        void* buffer = calloc(4096, sizeof(char));
+        ZipArchive* z1 = ZipArchive::fromWritableBuffer(&buffer, 4096, ZipArchive::New);
+        z1->addData("a.txt", "hello", 5);
+        z1->addData("b.txt", "world", 5);
+        assert(z1->close() == LIBZIPPP_OK);
+        libzippp_uint32 len1 = (libzippp_uint32)z1->getBufferLength();
+        ZipArchive::free(z1);
+
+        //reopen at the exact archive size (no headroom) and add ~8KB of incompressible data
+        string big;
+        big.reserve(8192);
+        for (int i = 0; i < 8192; ++i) { big.push_back((char)((i * 2654435761u) >> 13)); }
+
+        ZipArchive* z2 = ZipArchive::fromWritableBuffer(&buffer, len1, ZipArchive::Write);
+        assert(z2 != nullptr);
+        z2->addData("big.bin", big.data(), big.size());
+        assert(z2->close() == LIBZIPPP_OK);
+        libzippp_uint32 len2 = (libzippp_uint32)z2->getBufferLength();
+        assert(len2 > len1); //the buffer actually grew
+        ZipArchive::free(z2);
+
+        ZipArchive* z3 = ZipArchive::fromBuffer(buffer, len2, true);
+        assert(z3 != nullptr);
+        assert(z3->getNbEntries() == 3);
+        assert(z3->hasEntry("a.txt"));
+        assert(z3->hasEntry("b.txt"));
+        assert(z3->hasEntry("big.bin"));
+        assert(z3->getEntry("big.bin").readAsText() == big);
+        ZipArchive::free(z3);
+
+        free(buffer);
+    }
+
+    cout << " done." << endl;
+}
+
 int main() {
     test1();  test2();  test3();  test4();  test5();
     test6();  test7();  test8();  test9();  test10();
     test11(); test12(); test13(); test14(); test15();
     test16(); test17(); test18(); test19(); test20();
     test21(); test22(); test23(); test23_2(); test24();
+    test25();
     return 0;
 }
 
